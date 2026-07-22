@@ -1,0 +1,147 @@
+# WiFi Captive Portal Setup Guide
+
+## Prerequisites
+
+- Python 3.8+
+- Node.js (optional, for frontend dev server)
+- M-Pesa Daraja API credentials from https://developer.safaricom.co.ke
+
+## Step 1: Get Daraja API Credentials
+
+1. Visit https://developer.safaricom.co.ke
+2. Sign up for a developer account
+3. Create a new app
+4. Get your:
+   - Consumer Key
+   - Consumer Secret
+   - Shortcode
+   - Passkey
+
+## Step 2: Clone and Setup
+
+```bash
+git clone https://github.com/Emmanuel20code/wifi-captive-portal-mpesa.git
+cd wifi-captive-portal-mpesa
+```
+
+## Step 3: Install Dependencies
+
+```bash
+pip install -r backend/requirements.txt
+```
+
+## Step 4: Configure Environment
+
+Create `.env` file in project root:
+
+```bash
+MPESA_CONSUMER_KEY=your_key
+MPESA_CONSUMER_SECRET=your_secret
+MPESA_SHORTCODE=your_shortcode
+MPESA_PASSKEY=your_passkey
+MPESA_ENVIRONMENT=sandbox
+SECRET_KEY=your_secret_key
+CALLBACK_URL=http://localhost:5000/api/payment/callback
+```
+
+## Step 5: Initialize Database
+
+```bash
+python
+>>> from app import app, db
+>>> with app.app_context():
+...     db.create_all()
+>>> exit()
+```
+
+## Step 6: Run Server
+
+```bash
+python backend/app.py
+```
+
+Server runs at http://localhost:5000
+
+## Step 7: Test Credentials
+
+```bash
+curl -X POST http://localhost:5000/api/payment/test-credentials
+```
+
+## Testing with ngrok
+
+For production callback testing:
+
+```bash
+ngrok http 5000
+```
+
+Update `CALLBACK_URL` with ngrok URL.
+
+## Docker Setup
+
+```bash
+docker-compose up
+```
+
+## API Testing
+
+### 1. Test Login
+```bash
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"phone_number": "0712345678"}'
+```
+
+### 2. Initiate Payment
+```bash
+curl -X POST http://localhost:5000/api/payment/initiate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone_number": "254712345678",
+    "amount": 100,
+    "user_id": 1
+  }'
+```
+
+### 3. Check Payment Status
+```bash
+curl http://localhost:5000/api/payment/status/1
+```
+
+### 4. Get Statistics
+```bash
+curl http://localhost:5000/api/admin/statistics
+```
+
+## WiFi Router Configuration
+
+### For MikroTik:
+
+1. Go to IP → Hotspot → Hotspot Profiles
+2. Create new profile
+3. Set Login Page: `http://your-portal-url/`
+4. Apply to hotspot service
+
+### For OpenWrt:
+
+1. SSH into router
+2. Configure Hostapd for captive portal
+3. Set redirect to: `http://your-portal-ip:5000/`
+
+## Troubleshooting
+
+**M-Pesa connection failed:**
+- Verify credentials in `.env`
+- Check if in sandbox or production environment
+- Ensure callback URL is reachable
+
+**Payment not completing:**
+- Check database logs
+- Verify M-Pesa PIN prompt appeared
+- Ensure sufficient M-Pesa balance
+
+**Callback not received:**
+- Use ngrok for local testing
+- Update CALLBACK_URL accordingly
+- Check firewall settings
