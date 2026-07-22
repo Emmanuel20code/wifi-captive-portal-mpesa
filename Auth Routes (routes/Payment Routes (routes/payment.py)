@@ -1,0 +1,199 @@
+from flask import Blueprint, request, jsonify
+from app import db, User, Transaction
+from datetime import datetime
+import requests
+import os
+from dotenv import load_dotenv
+import base64
+
+load_dotenv()
+
+bp = Blueprint('payment', __name__, url_prefix='/api/payment')
+
+# M-Pesa Daraja API Configuration
+MPESA_CONSUMER_KEY = os.getenv('MPESA_CONSUMER_KEY')
+MPESA_CONSUMER_SECRET = os.getenv('MPESA_CONSUMER_SECRET')
+MPESA_SHORTCODE = os.getenv('MPESA_SHORTCODE')
+MPESA_PASSKEY = os.getenv('MPESA_PASSKEY')
+MPESA_ENVIRONMENT = os.getenv('MPESA_ENVIRONMENT', 'sandbox')
+
+# URLs
+AUTH_URL = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+STK_PUSH_URL = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+TRANSACTION_STATUS_URL = "https://sandbox.safaricom.co.ke/mpesa/transactionstatus/v1/query"
+
+if MPESA_ENVIRONMENT == 'production':
+    AUTH_URL = "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+    STK_PUSH_URL = "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+    TRANSACTION_STATUS_URL = "https://api.safaricom.co.ke/mpesa/transactionstatus/v1/query"
+
+def get_access_token():
+    """Get M-Pesa access token"""
+    try:
+        auth_string = f"{MPESA_CONSUMER_KEY}:{MPESA_CONSUMER_SECRET}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        headers = {
+            'Authorization': f'Basic {encoded_auth}'
+        }
+        response = requests.get(AUTH_URL, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json()['access_token']
+    except Exception as e:
+        print(f"Error getting access token: {str(e)}")
+        return None
+
+@bp.route('/initiate', methods=['POST'])
+def initiate_payment():
+    """Initiate M-Pesa STK Push"""
+    data = request.get_json()
+    phone_number = data.get('phone_number', '').replace('+', '').replace(' ', '')
+    amount = data.get('amount')
+    user_id = data.get('user_id')
+    
+    # Validation
+    if not phone_number or not amount or not user_id:
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return jsonify({'error': 'Invalid amount'}), 400
+    
+    # Get access token
+    access_token = get_access_token()
+    if not access_token:
+        return jsonify({'error': 'Failed to authenticate with M-Pesa'}), 500
+    
+    # Prepare STK Push request
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    password = base64.b64encode(
+        f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{timestamp}".encode()
+    ).decode()
+    
+    payload = {
+        "BusinessShortCode": MPESA_SHORTCODE,
+        "Password": password,
+        "Timestamp": timestamp,
+        "TransactionType": "CustomerPayBillOnline",
+        "Amount": int(amount),
+        "PartyA": phone_number,
+        "PartyB": MPESA_SHORTCODE,
+        "PhoneNumber": phone_number,
+        "CallBackURL": os.getenv('CALLBACK_URL', 'http://localhost:5000/api/payment/callback'),
+        "AccountReference": f"WiFi-Portal-{user_id}",
+        "TransactionDesc": "WiFi Portal Payment"
+    }
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.post(
+            STK_PUSH_URL,
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        
+        # Create transaction record
+        transaction = Transaction(
+            user_id=user_id,
+            phone_number=phone_number,
+            amount=amount,
+            status='pending',
+            mpesa_reference=result.get('CheckoutRequestID')
+        )
+        db.session.add(transaction)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'checkout_request_id': result.get('CheckoutRequestID'),
+            'message': 'STK Push sent successfully',
+            'transaction_id': transaction.id
+        }), 200
+        
+    except Exception as e:
+        print(f"Error initiating payment: {str(e)}")
+        return jsonify({'error': f'Payment initiation failed: {str(e)}'}), 500
+
+@bp.route('/status/<int:transaction_id>', methods=['GET'])
+def get_payment_status(transaction_id):
+    """Get payment status"""
+    transaction = Transaction.query.get(transaction_id)
+    
+    if not transaction:
+        return jsonify({'error': 'Transaction not found'}), 404
+    
+    return jsonify({
+        'transaction_id': transaction.id,
+        'amount': transaction.amount,
+        'status': transaction.status,
+        'phone_number': transaction.phone_number,
+        'receipt_code': transaction.mpesa_receipt_code,
+        'created_at': transaction.created_at.isoformat(),
+        'updated_at': transaction.updated_at.isoformat()
+    }), 200
+
+@bp.route('/callback', methods=['POST'])
+def payment_callback():
+    """M-Pesa callback endpoint"""
+    try:
+        data = request.get_json()
+        
+        # Parse callback data
+        result = data.get('Body', {}).get('stkCallback', {})
+        checkout_id = result.get('CheckoutRequestID')
+        result_code = result.get('ResultCode')
+        
+        # Find transaction
+        transaction = Transaction.query.filter_by(mpesa_reference=checkout_id).first()
+        
+        if transaction:
+            if result_code == 0:
+                # Payment successful
+                callback_metadata = result.get('CallbackMetadata', {}).get('Item', [])
+                receipt_code = next(
+                    (item['Value'] for item in callback_metadata if item['Name'] == 'MpesaReceiptNumber'),
+                    None
+                )
+                
+                transaction.status = 'completed'
+                transaction.mpesa_receipt_code = receipt_code
+                transaction.updated_at = datetime.utcnow()
+                
+                # Mark user as active
+                user = User.query.get(transaction.user_id)
+                if user:
+                    user.is_active = True
+            else:
+                # Payment failed
+                transaction.status = 'failed'
+                transaction.updated_at = datetime.utcnow()
+            
+            db.session.commit()
+        
+        return jsonify({'ResultCode': 0, 'ResultDesc': 'Callback processed'}), 200
+        
+    except Exception as e:
+        print(f"Error processing callback: {str(e)}")
+        return jsonify({'error': 'Callback processing failed'}), 500
+
+@bp.route('/test-credentials', methods=['POST'])
+def test_credentials():
+    """Test M-Pesa credentials"""
+    access_token = get_access_token()
+    
+    if access_token:
+        return jsonify({
+            'success': True,
+            'message': 'Credentials are valid',
+            'token_sample': access_token[:20] + '...'
+        }), 200
+    else:
+        return jsonify({
+            'success': False,
+            'message': 'Failed to authenticate with Daraja API'
+        }), 400
