@@ -1,0 +1,40 @@
+from flask import Blueprint, request, jsonify
+from app import db, User
+import re
+
+bp = Blueprint('auth', __name__, url_prefix='/api/auth')
+
+@bp.route('/login', methods=['POST'])
+def login():
+    """Authenticate user with phone number"""
+    data = request.get_json()
+    phone_number = data.get('phone_number', '').strip()
+    
+    # Validate phone number (Kenya format)
+    if not re.match(r'^(\+254|0)?[71]\d{8}$', phone_number):
+        return jsonify({'error': 'Invalid phone number format'}), 400
+    
+    # Normalize phone number to +254 format
+    if phone_number.startswith('0'):
+        phone_number = '+254' + phone_number[1:]
+    elif not phone_number.startswith('+254'):
+        phone_number = '+254' + phone_number
+    
+    # Create or get user
+    user = User.query.filter_by(phone_number=phone_number).first()
+    if not user:
+        user = User(phone_number=phone_number)
+        db.session.add(user)
+        db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'user_id': user.id,
+        'phone_number': user.phone_number,
+        'message': 'Login successful'
+    }), 200
+
+@bp.route('/status', methods=['GET'])
+def status():
+    """Check authentication status"""
+    return jsonify({'status': 'authenticated'}), 200
